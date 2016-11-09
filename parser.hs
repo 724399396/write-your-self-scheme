@@ -21,6 +21,9 @@ data LispVal = Atom String
     | Ratio Rational
     | Complex (Complex Double)
     | Vector (Array Int LispVal)
+    | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+    | Func { params :: [String], vararg :: (Maybe String),
+             body :: [LispVal], closure :: Env }
 
 -- parse part
 symbol :: Parser Char
@@ -195,6 +198,12 @@ showVal (Bool True) = "#t"
 showVal (Bool False) = "#f"
 showVal (List contents) = "(" ++ unwordsList contents ++ ")"
 showVal (DottedList head tail) = "(" ++ unwordsList head ++ "." ++ showVal tail ++ ")"
+showVal (PrimitiveFunc _) = "<primitive>"
+showVal (Func {params = args, vararg = varargs, body = body, closure = env}) =
+  "(lambda (" ++ unwords (map show args) ++
+    (case varargs of
+       Nothing -> ""
+       Just arg -> " . " ++ arg) ++ ")  ...)"
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
@@ -234,6 +243,54 @@ trapError action = catchError action (return . show)
 extractValue :: ThrowsError a -> a
 extractValue (Right val) = val
 
+-- variable
+type Env = IORef [(String, IORef LispVal)]
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+type IOThrowsError = ErrorT LispError IO
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runErrorT (trapError action) >>= return . extractValue
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lookup var
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef var = do env <- liftIO $ readIORef envRef
+                       maybe (throwError $ UnboundVar "Getting an nubound variable" var)
+                             (liftIO . readIORef)
+                             (lookup var env)
+
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef var value = do env <- liftIO $ readIORef envRef
+                             maybe (throwError $ UnboundVar "Setting an unbound variable" var)
+                                   (liftIO . (flip writeIORef value))
+                                   (lookup var env)
+                             return value
+
+defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defineVar envRef var value = do
+  alreadyDefined <- liftIO $ isBound envRef var
+  if alreadyDefined
+     then setVar envRef var value
+     else liftIO $ do
+          valueRef <- newIORef value
+          env <- readIORef envRef
+          writeIORef envRef ((var, valueRef) : env)
+          return value
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
+  where extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
+        addBinding (var, value) = do ref <- newIORef value
+                                     return (var, ref)
+
 -- eval part
 eval :: Env -> LispVal -> IOThrowsError LispVal
 eval env val@(String _) = return val
@@ -248,15 +305,27 @@ eval env (List [Atom "if", pred, conseq, alt]) =
        Bool True  -> eval env conseq
        otherwise  -> throwError $ TypeMismatch "bool" result
 eval env (List [Atom "sett!", Atom var, form]) =
-  eval env form >>= setVar env var
+  eval env form >>= setVar
+  env var
 eval env (List [Atom "define", Atom var, form]) =
   eval env form >>= defineVar env var
 eval env (List (Atom "cond": left)) = cond env left
 eval env (List (Atom func: args)) = mapM (eval env) args >>= liftThrows . apply func
 eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe (throwError $ NotFunction "unrecgnized primitive function args" func)  ($ args) $ (lookup func primitives)
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc func) args = liftTrhows $ func args
+apply (Func params varargs body closure) args =
+  if num params /= num args && varargs == Nothing
+     then throwError $ NumArgs (num params) args
+     else (liftIO $ bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+  where remainingArgs = drop (length params) args
+        num = toInteger . length
+        evalBody env = liftM last $ mapM (eval env) body
+        bindVarArgs arg env = case arg of
+          Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
+          Nothing -> return env
+    
 
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [("+", numericBinop (+)),
@@ -368,12 +437,11 @@ eqv [(Number arg1), (Number arg2)]     = return $ Bool $ arg1 == arg2
 eqv [(String arg1), (String arg2)]     = return $ Bool $ arg1 == arg2
 eqv [(Atom arg1), (Atom arg2)]         = return $ Bool $ arg1 == arg2
 eqv [(DottedList xs x), (DottedList ys y)] = eqv [List $ xs ++ [x], List $ ys ++ [y]]
-eqv [l1@(List arg1), l2@(List arg2)]             = eqvList eqv [l1, l2]
-  where eqvPair (x1, x2) = case eqv [x1, x2] of
-                             Left err -> False
-                             Right (Bool val) -> val
-eqv [_, _]                                 = return $ Bool False
-eqv badArgList                             = throwError $ NumArgs 2 badArgList
+eqv [l1@(List arg1), l2@(List arg2)]   = eqvList eqv [l1, l2]
+eqv [_, _]                             = return $ Bool False
+eqv badArgList                         = throwError $ NumArgs 2 badArgList
+
+data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
 
 unpackEquals :: LispVal -> LispVal -> Unpacker -> ThrowsError Bool
 unpackEquals arg1 arg2 (AnyUnpacker unpacker) =
@@ -381,8 +449,6 @@ unpackEquals arg1 arg2 (AnyUnpacker unpacker) =
      unpacked2 <- unpacker arg2
      return $ unpacked1 == unpacked2
   `catchError` (const $ return False)
-
-data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
 
 equal :: [LispVal] -> ThrowsError LispVal
 equal [l1@(List arg1), l2@(List arg2)] = eqvList equal [l1, l2]
@@ -446,54 +512,6 @@ runOne expr = nullEnv >>= flip evalAndPrint expr
 
 runRepl :: IO ()
 runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
-
--- variable
-type Env = IORef [(String, IORef LispVal)]
-
-nullEnv :: IO Env
-nullEnv = newIORef []
-
-type IOThrowsError = ErrorT LispError IO
-
-liftThrows :: ThrowsError a -> IOThrowsError a
-liftThrows (Left err) = throwError err
-liftThrows (Right val) = return val
-
-runIOThrows :: IOThrowsError String -> IO String
-runIOThrows action = runErrorT (trapError action) >>= return . extractValue
-
-isBound :: Env -> String -> IO Bool
-isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lookup var
-
-getVar :: Env -> String -> IOThrowsError LispVal
-getVar envRef var = do env <- liftIO $ readIORef envRef
-                       maybe (throwError $ UnboundVar "Getting an nubound variable" var)
-                             (liftIO . readIORef)
-                             (lookup var env)
-
-setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
-setVar envRef var value = do env <- liftIO $ readIORef envRef
-                             maybe (throwError $ UnboundVar "Setting an unbound variable" var)
-                                   (liftIO . (flip writeIORef value))
-                                   (lookup var env)
-                             return value
-
-defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
-defineVar envRef var value = do
-  alreadyDefined <- liftIO $ isBound envRef var
-  if alreadyDefined
-     then setVar envRef var value
-     else liftIO $ do
-          valueRef <- newIORef value
-          env <- readIORef envRef
-          writeIORef envRef ((var, valueRef) : env)
-          return value
-
-bindVars :: Env -> [(String, LispVal)] -> IO Env
-bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
-  where extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
-        addBinding (var, value) = do ref <- newIORef value
-                                     return (var, ref)
 
 -- entrace
 main :: IO()
