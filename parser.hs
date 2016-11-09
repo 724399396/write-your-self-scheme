@@ -304,17 +304,29 @@ eval env (List [Atom "if", pred, conseq, alt]) =
        Bool False -> eval env  alt
        Bool True  -> eval env conseq
        otherwise  -> throwError $ TypeMismatch "bool" result
-eval env (List [Atom "sett!", Atom var, form]) =
-  eval env form >>= setVar
-  env var
+eval env (List [Atom "set!", Atom var, form]) =
+  eval env form >>= setVar env var
 eval env (List [Atom "define", Atom var, form]) =
   eval env form >>= defineVar env var
 eval env (List (Atom "cond": left)) = cond env left
-eval env (List (Atom func: args)) = mapM (eval env) args >>= liftThrows . apply func
+eval env (List (Atom "define" : List (Atom var : params) : body)) =
+  makeNormalFunc env params body >>= defineVar env var
+eval env (List (Atom "define" : DottedList (Atom var : params) varargs : body)) =
+  makeVarArgs varargs env params body >>= defineVar env var
+eval env (List (Atom "lambda" : List params : body)) =
+  makeNormalFunc env params body
+eval env (List (Atom "lambda" : DottedList params varargs : body)) =
+  makeVarArgs varargs env params body
+eval env (List (Atom "lambda" : varargs@(Atom _) : body)) =
+  makeVarArgs varargs env [] body
+eval env (List (function : args)) = do
+  func <- eval env function
+  argVals <- mapM (eval env) args
+  apply func argVals
 eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
-apply (PrimitiveFunc func) args = liftTrhows $ func args
+apply (PrimitiveFunc func) args = liftThrows $ func args
 apply (Func params varargs body closure) args =
   if num params /= num args && varargs == Nothing
      then throwError $ NumArgs (num params) args
@@ -325,7 +337,15 @@ apply (Func params varargs body closure) args =
         bindVarArgs arg env = case arg of
           Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
           Nothing -> return env
-    
+
+
+makeFunc varargs env params body = return $ Func (map showVal params) varargs body env
+makeNormalFunc = makeFunc Nothing
+makeVarArgs = makeFunc . Just . showVal
+
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+  where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
 
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [("+", numericBinop (+)),
@@ -481,7 +501,6 @@ unpackBoolCond :: LispVal -> IOThrowsError Bool
 unpackBoolCond (Bool b) = return b
 unpackBoolCond notBool  = throwError $ TypeMismatch "bool" notBool
 
-
 readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
   Left err  -> throwError $ Parser err
@@ -508,10 +527,10 @@ until_ pred prompt action = do
     else action result >> until_ pred prompt action
 
 runOne :: String -> IO ()
-runOne expr = nullEnv >>= flip evalAndPrint expr
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
 
 runRepl :: IO ()
-runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
 
 -- entrace
 main :: IO()
