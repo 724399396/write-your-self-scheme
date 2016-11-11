@@ -363,7 +363,7 @@ primitives = [("+", numericBinop (+)),
               ("quotient", numericBinop quot),
               ("remainder", numericBinop rem),
               ("symbol?", unaryOp symbolp),
-              ("string?" , unaryOp stringp) ,
+               ("string?" , unaryOp stringp) ,
               ("number?" , unaryOp numberp) ,
               ("bool?", unaryOp boolp) ,
               ("list?" , unaryOp listp),
@@ -508,14 +508,6 @@ unpackBoolCond :: LispVal -> IOThrowsError Bool
 unpackBoolCond (Bool b) = return b
 unpackBoolCond notBool  = throwError $ TypeMismatch "bool" notBool
 
-readOrThrow :: Parser a -> String -> ThrowsError a
-readOrThrow parser input = case parse parser "lisp" input of
-  Left err -> throwError $ Parser err
-  Right val -> return val
-
-readExpr = readOrThrow parseExpr
-readExprList = readOrThrow (endBy parseExpr spaces)
-
 ioPrimitives :: [(String, [LispVal] -> IOThrowsError LispVal)]
 ioPrimitives = [("apply", applyProc),
                 ("open-input-file", makePort ReadMode),
@@ -554,6 +546,15 @@ load filename = (liftIO $ readFile filename) >>= liftThrows . readExprList
 
 readAll :: [LispVal] -> IOThrowsError LispVal
 readAll [String filename] = liftM List $ load filename
+
+-- parse part 2
+readOrThrow :: Parser a -> String -> ThrowsError a
+readOrThrow parser input = case parse parser "lisp" input of
+  Left err -> throwError $ Parser err
+  Right val -> return val
+
+readExpr = readOrThrow parseExpr
+readExprList = readOrThrow (endBy parseExpr spaces)
 
 -- repl
 flushStr :: String -> IO ()
